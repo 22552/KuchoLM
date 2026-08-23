@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from huggingface_hub import hf_hub_download
 
-parser = argparse.ArgumentParser(description='Download a KuchoLM .pt checkpoint from Hugging Face and export it to ONNX.')
+parser = argparse.ArgumentParser(description='Download a KuchoLM .pt checkpoint from Hugging Face and export a browser-friendly ONNX model.')
 parser.add_argument('--repo', default='h6e/KuchoLM-NIDA-10M', help='Hugging Face model repo ID')
 parser.add_argument('--pt', default='KuchoLM-NIDA-10M.pt', help='Checkpoint filename inside the Hugging Face repo')
 parser.add_argument('--out', default='/content/model.onnx', help='Output ONNX path')
@@ -22,9 +22,6 @@ ckpt = torch.load(checkpoint_path, map_location='cpu')
 state = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
 cfg = ckpt.get('config', {}) if isinstance(ckpt, dict) else {}
 
-# KuchoLM has had two checkpoint naming/layout variants:
-# legacy: emb / tr / head / sinusoidal pos.pe
-# current: embed / tf / lm_head / learned pos.weight
 if 'embed.weight' in state:
     FORMAT = 'current'
     EMB_KEY = 'embed.weight'
@@ -49,14 +46,9 @@ PAD = 0
 print('format:', FORMAT)
 print(f'config: vocab={VOCAB} d_model={D_MODEL} heads={NHEAD} enc={ENC_LAYERS} dec={DEC_LAYERS} ff={FF} max_len={MAX_LEN}')
 
-
-def causal_bool_mask(length, device):
-    # A boolean causal mask is considerably simpler for ONNX Runtime Web than
-    # PyTorch's float mask containing -inf. Browser inference uses batch=1 and
-    # variable-length tensors with no padding, so key-padding masks are not
-    # needed at all and are deliberately omitted from the exported graph.
-    positions = torch.arange(length, device=device)
-    return positions.unsqueeze(0) > positions.unsqueeze(1)
+# Fixed causal mask. Keeping it as a buffer avoids dynamic shape/arange logic in
+# the ONNX graph, which has been unreliable in ONNX Runtime Web/WASM on iOS.
+CAUSAL_MASK = torch.triu(torch.ones(MAX_LEN, MAX_LEN, dtype=torch.bool), diagonal=1)
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -70,7 +62,7 @@ class SinusoidalPositionalEncoding(nn.Module):
         self.register_buffer('pe', pe.unsqueeze(0))
 
     def forward(self, x):
-        return x + self.pe[:, :x.size(1)]
+        return x + self.pe[:, :MAX_LEN]
 
 
 class LegacyKuchoTransformer(nn.Module):
@@ -79,23 +71,27 @@ class LegacyKuchoTransformer(nn.Module):
         self.emb = nn.Embedding(VOCAB, D_MODEL, padding_idx=PAD)
         self.pos = SinusoidalPositionalEncoding(D_MODEL, MAX_LEN)
         self.tr = nn.Transformer(
-            d_model=D_MODEL,
-            nhead=NHEAD,
-            num_encoder_layers=ENC_LAYERS,
-            num_decoder_layers=DEC_LAYERS,
-            dim_feedforward=FF,
-            dropout=0.0,
-            batch_first=True,
-            norm_first=True,
+            d_model=D_MODEL, nhead=NHEAD,
+            num_encoder_layers=ENC_LAYERS, num_decoder_layers=DEC_LAYERS,
+            dim_feedforward=FF, dropout=0.0,
+            batch_first=True, norm_first=True,
         )
         self.head = nn.Linear(D_MODEL, VOCAB, bias=False)
         self.head.weight = self.emb.weight
+        self.register_buffer('causal_mask', CAUSAL_MASK)
 
     def forward(self, src, tgt_in):
-        mask = causal_bool_mask(tgt_in.size(1), tgt_in.device)
+        src_pad = src.eq(PAD)
+        tgt_pad = tgt_in.eq(PAD)
         src_h = self.pos(self.emb(src) * math.sqrt(D_MODEL))
         tgt_h = self.pos(self.emb(tgt_in) * math.sqrt(D_MODEL))
-        h = self.tr(src_h, tgt_h, tgt_mask=mask)
+        h = self.tr(
+            src_h, tgt_h,
+            tgt_mask=self.causal_mask,
+            src_key_padding_mask=src_pad,
+            tgt_key_padding_mask=tgt_pad,
+            memory_key_padding_mask=src_pad,
+        )
         return self.head(h)
 
 
@@ -105,25 +101,29 @@ class CurrentKuchoTransformer(nn.Module):
         self.embed = nn.Embedding(VOCAB, D_MODEL, padding_idx=PAD)
         self.pos = nn.Embedding(MAX_LEN, D_MODEL)
         self.tf = nn.Transformer(
-            d_model=D_MODEL,
-            nhead=NHEAD,
-            num_encoder_layers=ENC_LAYERS,
-            num_decoder_layers=DEC_LAYERS,
-            dim_feedforward=FF,
-            dropout=0.0,
-            batch_first=True,
-            norm_first=True,
+            d_model=D_MODEL, nhead=NHEAD,
+            num_encoder_layers=ENC_LAYERS, num_decoder_layers=DEC_LAYERS,
+            dim_feedforward=FF, dropout=0.0,
+            batch_first=True, norm_first=True,
         )
         self.lm_head = nn.Linear(D_MODEL, VOCAB, bias=False)
         self.lm_head.weight = self.embed.weight
+        self.register_buffer('positions', torch.arange(MAX_LEN, dtype=torch.long).unsqueeze(0))
+        self.register_buffer('causal_mask', CAUSAL_MASK)
 
     def add_pos(self, x):
-        p = torch.arange(x.size(1), device=x.device).unsqueeze(0)
-        return self.embed(x) * math.sqrt(D_MODEL) + self.pos(p)
+        return self.embed(x) * math.sqrt(D_MODEL) + self.pos(self.positions)
 
     def forward(self, src, tgt_in):
-        mask = causal_bool_mask(tgt_in.size(1), tgt_in.device)
-        h = self.tf(self.add_pos(src), self.add_pos(tgt_in), tgt_mask=mask)
+        src_pad = src.eq(PAD)
+        tgt_pad = tgt_in.eq(PAD)
+        h = self.tf(
+            self.add_pos(src), self.add_pos(tgt_in),
+            tgt_mask=self.causal_mask,
+            src_key_padding_mask=src_pad,
+            tgt_key_padding_mask=tgt_pad,
+            memory_key_padding_mask=src_pad,
+        )
         return self.lm_head(h)
 
 
@@ -135,8 +135,13 @@ if FORMAT == 'legacy':
     if checkpoint_pe is not None and hasattr(model.pos, 'pe'):
         print('checkpoint pos.pe:', tuple(checkpoint_pe.shape), '-> regenerated:', tuple(model.pos.pe.shape))
 
+# Browser-only constant buffers are generated by the exporter and do not exist
+# in training checkpoints.
 missing, unexpected = model.load_state_dict(state_to_load, strict=False)
-real_missing = [k for k in missing if not (FORMAT == 'legacy' and k == 'pos.pe')]
+allowed_missing = {'positions', 'causal_mask'}
+if FORMAT == 'legacy':
+    allowed_missing.add('pos.pe')
+real_missing = [k for k in missing if k not in allowed_missing]
 if real_missing or unexpected:
     raise RuntimeError(f'state_dict mismatch: missing={real_missing}, unexpected={unexpected}')
 
@@ -147,14 +152,15 @@ print(f'parameters: {params / 1e6:.2f}M')
 fastpath_was_enabled = torch.backends.mha.get_fastpath_enabled()
 torch.backends.mha.set_fastpath_enabled(False)
 print('mha fastpath: disabled for ONNX export')
-print('browser export: boolean causal mask, no key-padding masks')
+print(f'browser export: FIXED batch=1 src={MAX_LEN} tgt={MAX_LEN}, explicit PAD masks')
 
-src = torch.tensor([[2, 10, 11, 3]], dtype=torch.long)
-tgt = torch.tensor([[2, 10]], dtype=torch.long)
+src = torch.full((1, MAX_LEN), PAD, dtype=torch.long)
+src[0, :4] = torch.tensor([2, 10, 11, 3])
+tgt = torch.full((1, MAX_LEN), PAD, dtype=torch.long)
+tgt[0, :2] = torch.tensor([2, 10])
 
 try:
     with torch.no_grad():
-        # Verify the exact wrapper before exporting it.
         smoke = model(src, tgt)
         print('pytorch smoke:', tuple(smoke.shape), 'finite=', bool(torch.isfinite(smoke).all()))
 
@@ -164,11 +170,7 @@ try:
             out_path,
             input_names=['src', 'tgt_in'],
             output_names=['logits'],
-            dynamic_axes={
-                'src': {0: 'batch', 1: 'src_len'},
-                'tgt_in': {0: 'batch', 1: 'tgt_len'},
-                'logits': {0: 'batch', 1: 'tgt_len'},
-            },
+            # No dynamic_axes: fixed shapes are intentional for Web/WASM.
             opset_version=18,
             do_constant_folding=True,
             dynamo=False,
@@ -177,4 +179,5 @@ finally:
     torch.backends.mha.set_fastpath_enabled(fastpath_was_enabled)
 
 print('saved:', out_path)
+print('expected inputs: src=[1,128], tgt_in=[1,128]')
 print('source:', f'https://huggingface.co/{args.repo}/blob/main/{args.pt}')
