@@ -24,7 +24,7 @@
 
       <button id="convert" disabled>Loading model…</button>
 
-      <div class="status" id="status">初回はモデルをダウンロードします。</div>
+      <div class="status" id="status">初回はモデルをダウンロードします。2回目以降は端末キャッシュを使用します。</div>
 
       <label for="output">Output</label>
       <textarea id="output" rows="7" readonly></textarea>
@@ -36,6 +36,21 @@
     </footer>
   </main>
 
-  <script type="module" src="./app.js"></script>
+  <script type="module">
+    if ('serviceWorker' in navigator) {
+      try {
+        await navigator.serviceWorker.register('./sw.js');
+        await navigator.serviceWorker.ready;
+        if (!navigator.serviceWorker.controller) {
+          await new Promise((resolve) => {
+            navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
+          });
+        }
+      } catch (err) {
+        console.warn('Service Worker registration failed:', err);
+      }
+    }
+    await import('./app.js');
+  </script>
 </body>
 </html>
