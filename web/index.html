@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>KuchoLM NIDA Web</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      <h1>KuchoLM NIDA</h1>
+      <p>完全ブラウザ内で動く、日本語口調変換デモ。</p>
+    </header>
+
+    <section class="panel">
+      <label for="model">Model</label>
+      <select id="model">
+        <option value="10m" selected>NIDA-10M</option>
+      </select>
+
+      <label for="input">Input</label>
+      <textarea id="input" rows="7" placeholder="今日は学校です。"></textarea>
+
+      <button id="convert" disabled>Loading model…</button>
+
+      <div class="status" id="status">初回はモデルをダウンロードします。</div>
+
+      <label for="output">Output</label>
+      <textarea id="output" rows="7" readonly></textarea>
+    </section>
+
+    <footer>
+      <p>入力文はサーバーへ送信されません。</p>
+      <p><a href="https://huggingface.co/h6e/KuchoLM-NIDA-10M" target="_blank" rel="noreferrer">KuchoLM-NIDA-10M on Hugging Face</a></p>
+    </footer>
+  </main>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
