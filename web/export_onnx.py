@@ -1,13 +1,28 @@
 from pathlib import Path
+import argparse
 import math
 import torch
 from torch import nn
+from huggingface_hub import hf_hub_download
 
-CHECKPOINT = Path('/content/kucholm_work/KuchoLM-NIDA-10M.pt')
-OUT = Path('/content/model.onnx')
+parser = argparse.ArgumentParser(description='Download a KuchoLM .pt checkpoint from Hugging Face and export it to ONNX.')
+parser.add_argument('--repo', default='h6e/KuchoLM-NIDA-10M', help='Hugging Face model repo ID')
+parser.add_argument('--pt', default='KuchoLM-NIDA.pt', help='Checkpoint filename inside the Hugging Face repo')
+parser.add_argument('--out', default='/content/model.onnx', help='Output ONNX path')
+args = parser.parse_args()
 
-ckpt = torch.load(CHECKPOINT, map_location='cpu')
-cfg = ckpt.get('config', {})
+print('repo:', args.repo)
+print('checkpoint:', args.pt)
+
+checkpoint_path = Path(hf_hub_download(repo_id=args.repo, filename=args.pt, repo_type='model'))
+out_path = Path(args.out)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+print('downloaded:', checkpoint_path)
+
+ckpt = torch.load(checkpoint_path, map_location='cpu')
+cfg = ckpt.get('config', {}) if isinstance(ckpt, dict) else {}
+
 VOCAB = int(cfg.get('vocab', 8000))
 D_MODEL = int(cfg.get('d_model', 256))
 NHEAD = int(cfg.get('nhead', 8))
@@ -16,6 +31,8 @@ DEC_LAYERS = int(cfg.get('dec_layers', 4))
 FF = int(cfg.get('ff', 1024))
 MAX_LEN = int(cfg.get('max_len', 128))
 PAD = 0
+
+print(f'config: vocab={VOCAB} d_model={D_MODEL} heads={NHEAD} enc={ENC_LAYERS} dec={DEC_LAYERS} ff={FF} max_len={MAX_LEN}')
 
 class KuchoTransformer(nn.Module):
     def __init__(self):
@@ -54,8 +71,12 @@ class KuchoTransformer(nn.Module):
         return self.lm_head(h)
 
 model = KuchoTransformer()
-model.load_state_dict(ckpt['model'] if 'model' in ckpt else ckpt)
+state = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
+model.load_state_dict(state)
 model.eval()
+
+params = sum(p.numel() for p in model.parameters())
+print(f'parameters: {params / 1e6:.2f}M')
 
 src = torch.tensor([[2, 10, 11, 3]], dtype=torch.long)
 tgt = torch.tensor([[2, 10]], dtype=torch.long)
@@ -64,7 +85,7 @@ with torch.no_grad():
     torch.onnx.export(
         model,
         (src, tgt),
-        OUT,
+        out_path,
         input_names=['src', 'tgt_in'],
         output_names=['logits'],
         dynamic_axes={
@@ -76,5 +97,5 @@ with torch.no_grad():
         do_constant_folding=True,
     )
 
-print('saved:', OUT)
-print('Upload model.onnx to: https://huggingface.co/h6e/KuchoLM-NIDA-10M')
+print('saved:', out_path)
+print('source:', f'https://huggingface.co/{args.repo}/blob/main/{args.pt}')
