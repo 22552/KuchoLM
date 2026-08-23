@@ -55,13 +55,16 @@ function formatBytes(bytes) {
   return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
-async function downloadWithProgress(url, label, overallStart = 0, overallSpan = 100) {
-  setStatus(`${label}へ接続中…`);
+// Only the tiny tokenizer is downloaded manually so we can show progress.
+// The ONNX model is passed to ORT by URL directly to avoid keeping another
+// full model copy in JS memory before ORT copies/loads it into WASM memory.
+async function downloadTokenizerWithProgress(url) {
+  setStatus('Tokenizerへ接続中…');
   const response = await fetch(url, { cache: 'no-store' });
-  if (!response.ok) throw new Error(`${label} download failed (${response.status})`);
+  if (!response.ok) throw new Error(`Tokenizer download failed (${response.status})`);
 
   if (!response.body) {
-    setStatus(`${label}をダウンロード中…`);
+    setStatus('Tokenizerをダウンロード中…');
     return new Uint8Array(await response.arrayBuffer());
   }
 
@@ -77,11 +80,10 @@ async function downloadWithProgress(url, label, overallStart = 0, overallSpan = 
     received += value.byteLength;
 
     if (total > 0) {
-      const localPercent = Math.min(100, Math.round((received / total) * 100));
-      const overallPercent = Math.min(100, Math.round(overallStart + (localPercent / 100) * overallSpan));
-      setStatus(`${label}をダウンロード中… ${localPercent}% (${formatBytes(received)} / ${formatBytes(total)}) — 全体 ${overallPercent}%`);
+      const percent = Math.min(100, Math.round((received / total) * 100));
+      setStatus(`Tokenizerをダウンロード中… ${percent}% (${formatBytes(received)} / ${formatBytes(total)})`);
     } else {
-      setStatus(`${label}をダウンロード中… ${formatBytes(received)}`);
+      setStatus(`Tokenizerをダウンロード中… ${formatBytes(received)}`);
     }
   }
 
@@ -206,7 +208,6 @@ class BrowserSentencePieceBPE {
       this.pieceToId.set(p.piece, id);
       if (p.type === 4 && p.piece) this.userDefined.push(p.piece);
     }
-
     this.userDefined.sort((a, b) => b.length - a.length);
   }
 
@@ -229,8 +230,7 @@ class BrowserSentencePieceBPE {
       }
 
       if (matched) {
-        const id = this.pieceToId.get(matched);
-        symbols.push({ text: matched, id, locked: true });
+        symbols.push({ text: matched, id: this.pieceToId.get(matched), locked: true });
         i += matched.length;
         continue;
       }
@@ -246,8 +246,7 @@ class BrowserSentencePieceBPE {
   }
 
   encodeIds(text) {
-    const normalized = this.normalize(text);
-    const symbols = this.initialSymbols(normalized);
+    const symbols = this.initialSymbols(this.normalize(text));
 
     while (symbols.length > 1) {
       let bestIndex = -1;
@@ -315,12 +314,11 @@ function argmaxLastToken(logits, generated, repetitionPenalty = 1.15) {
 
 async function smokeTestOnnx() {
   setStatus('ONNXをテスト中…');
-  const feeds = {
-    src: toInt64Tensor([BOS, EOS]),
-    tgt_in: toInt64Tensor([BOS]),
-  };
   try {
-    const result = await session.run(feeds);
+    const result = await session.run({
+      src: toInt64Tensor([BOS, EOS]),
+      tgt_in: toInt64Tensor([BOS]),
+    });
     const logits = result.logits ?? result[session.outputNames[0]];
     if (!logits || logits.dims.at(-1) !== VOCAB_SIZE) {
       throw new Error(`unexpected logits shape: ${logits ? logits.dims.join('x') : 'none'}`);
@@ -334,23 +332,24 @@ async function init() {
   try {
     convertBtn.disabled = true;
     convertBtn.textContent = 'Loading…';
-    setStatus('起動しました。モデルを取得します…');
 
-    ort.env.wasm.numThreads = globalThis.crossOriginIsolated
-      ? Math.min(navigator.hardwareConcurrency || 1, 4)
-      : 1;
+    ort.env.wasm.numThreads = 1;
 
-    const modelBytes = await downloadWithProgress(MODEL_URL, 'モデル', 0, 90);
-    setStatus('モデルを初期化中… 90%');
-    session = await ort.InferenceSession.create(modelBytes, {
+    // Important on iPhone/iOS Safari: let ORT fetch the model directly. Do not
+    // materialize the whole ONNX file as a JS Uint8Array first.
+    setStatus('モデルを読み込み中…');
+    session = await ort.InferenceSession.create(MODEL_URL, {
       executionProviders: ['wasm'],
-      graphOptimizationLevel: 'all',
+      graphOptimizationLevel: 'basic',
+      enableCpuMemArena: false,
+      enableMemPattern: false,
+      executionMode: 'sequential',
     });
 
     await smokeTestOnnx();
 
-    const tokenizerBytes = await downloadWithProgress(TOKENIZER_URL, 'Tokenizer', 90, 10);
-    setStatus('Tokenizerを解析中… 100%');
+    const tokenizerBytes = await downloadTokenizerWithProgress(TOKENIZER_URL);
+    setStatus('Tokenizerを解析中…');
     tokenizer = new BrowserSentencePieceBPE(tokenizerBytes);
 
     if (tokenizer.pieces.length !== VOCAB_SIZE) {
@@ -360,7 +359,7 @@ async function init() {
     const probe = tokenizer.encodeIds(`${STYLE_PREFIX}今日は学校です。`);
     validateIds(probe, 'Tokenizer self-test');
 
-    setStatus('準備完了。ダウンロード 100%。ONNX/TokenizerテストOK。');
+    setStatus('準備完了。ONNX/TokenizerテストOK。');
     convertBtn.textContent = 'Convert';
     convertBtn.disabled = false;
   } catch (err) {
