@@ -81,14 +81,19 @@ class KuchoTransformer(nn.Module):
         return self.head(h)
 
 model = KuchoTransformer()
-missing, unexpected = model.load_state_dict(state, strict=False)
 
-# Older checkpoints sometimes stored a longer sinusoidal PE buffer. It is not a learned
-# parameter, so only pos.pe is allowed to differ. Any other mismatch is a real error.
+# pos.pe is a deterministic sinusoidal buffer, not a learned parameter.
+# Old checkpoints stored 1024 positions while newer configs may use 128.
+# Remove it before loading so PyTorch does not reject the size mismatch.
+state_to_load = dict(state)
+checkpoint_pe = state_to_load.pop('pos.pe', None)
+if checkpoint_pe is not None:
+    print('checkpoint pos.pe:', tuple(checkpoint_pe.shape), '-> regenerated:', tuple(model.pos.pe.shape))
+
+missing, unexpected = model.load_state_dict(state_to_load, strict=False)
 real_missing = [k for k in missing if k != 'pos.pe']
-real_unexpected = [k for k in unexpected if k != 'pos.pe']
-if real_missing or real_unexpected:
-    raise RuntimeError(f'state_dict mismatch: missing={real_missing}, unexpected={real_unexpected}')
+if real_missing or unexpected:
+    raise RuntimeError(f'state_dict mismatch: missing={real_missing}, unexpected={unexpected}')
 
 model.eval()
 params = sum(p.numel() for p in model.parameters())
