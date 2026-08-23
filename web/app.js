@@ -7,6 +7,7 @@ const PAD = 0;
 const UNK = 1;
 const BOS = 2;
 const EOS = 3;
+const VOCAB_SIZE = 8000;
 const MAX_LEN = 128;
 const STYLE_PREFIX = '<NIDA_FICTION> ';
 const SPIECE_UNDERLINE = '▁';
@@ -25,6 +26,21 @@ function setStatus(message) {
 
 function toInt64Tensor(ids) {
   return new ort.Tensor('int64', BigInt64Array.from(ids, (x) => BigInt(x)), [1, ids.length]);
+}
+
+function errorText(err) {
+  if (err instanceof Error && err.message) return err.message;
+  try { return String(err); } catch { return 'unknown error'; }
+}
+
+function validateIds(ids, label) {
+  if (!Array.isArray(ids) || ids.length === 0) throw new Error(`${label}: empty token list`);
+  for (let i = 0; i < ids.length; i++) {
+    const id = Number(ids[i]);
+    if (!Number.isInteger(id) || id < 0 || id >= VOCAB_SIZE) {
+      throw new Error(`${label}: token id out of range at ${i}: ${id}`);
+    }
+  }
 }
 
 function formatBytes(bytes) {
@@ -151,10 +167,6 @@ function parseSentencePieceModel(bytes) {
   const state = { i: 0 };
   const pieces = [];
 
-  // SentencePiece serializes ModelProto.pieces (field 1) first, followed by
-  // TrainerSpec / NormalizerSpec metadata. We only need the vocabulary for
-  // browser inference, so stop as soon as the contiguous piece list ends.
-  // This deliberately avoids trying to fully decode unrelated protobuf specs.
   while (state.i < bytes.length) {
     const keyStart = state.i;
     const key = readVarint(bytes, state);
@@ -172,8 +184,6 @@ function parseSentencePieceModel(bytes) {
     }
 
     if (pieces.length > 0) {
-      // Vocabulary is complete; the remaining fields are metadata that is not
-      // required by the lightweight browser tokenizer.
       state.i = keyStart;
       break;
     }
@@ -274,11 +284,8 @@ class BrowserSentencePieceBPE {
       const p = this.pieces[id];
       if (!p) continue;
       if (p.type === 3) continue;
-      if (p.type === 2) {
-        text += '⁇';
-      } else {
-        text += p.piece;
-      }
+      if (p.type === 2) text += '⁇';
+      else text += p.piece;
     }
     return text.replaceAll(SPIECE_UNDERLINE, ' ').replace(/^ /, '');
   }
@@ -306,6 +313,23 @@ function argmaxLastToken(logits, generated, repetitionPenalty = 1.15) {
   return bestId;
 }
 
+async function smokeTestOnnx() {
+  setStatus('ONNXをテスト中…');
+  const feeds = {
+    src: toInt64Tensor([BOS, EOS]),
+    tgt_in: toInt64Tensor([BOS]),
+  };
+  try {
+    const result = await session.run(feeds);
+    const logits = result.logits ?? result[session.outputNames[0]];
+    if (!logits || logits.dims.at(-1) !== VOCAB_SIZE) {
+      throw new Error(`unexpected logits shape: ${logits ? logits.dims.join('x') : 'none'}`);
+    }
+  } catch (err) {
+    throw new Error(`ONNXスモークテスト失敗: ${errorText(err)} / inputs=${session.inputNames.join(',')} outputs=${session.outputNames.join(',')}`);
+  }
+}
+
 async function init() {
   try {
     convertBtn.disabled = true;
@@ -323,20 +347,25 @@ async function init() {
       graphOptimizationLevel: 'all',
     });
 
+    await smokeTestOnnx();
+
     const tokenizerBytes = await downloadWithProgress(TOKENIZER_URL, 'Tokenizer', 90, 10);
     setStatus('Tokenizerを解析中… 100%');
     tokenizer = new BrowserSentencePieceBPE(tokenizerBytes);
 
-    if (tokenizer.pieces.length !== 8000) {
-      throw new Error(`Tokenizer vocab mismatch: expected 8000, got ${tokenizer.pieces.length}`);
+    if (tokenizer.pieces.length !== VOCAB_SIZE) {
+      throw new Error(`Tokenizer vocab mismatch: expected ${VOCAB_SIZE}, got ${tokenizer.pieces.length}`);
     }
 
-    setStatus('準備完了。ダウンロード 100%。推論はこの端末内だけで実行されます。');
+    const probe = tokenizer.encodeIds(`${STYLE_PREFIX}今日は学校です。`);
+    validateIds(probe, 'Tokenizer self-test');
+
+    setStatus('準備完了。ダウンロード 100%。ONNX/TokenizerテストOK。');
     convertBtn.textContent = 'Convert';
     convertBtn.disabled = false;
   } catch (err) {
     console.error(err);
-    setStatus(`読み込み失敗: ${err?.message || err}`);
+    setStatus(`読み込み失敗: ${errorText(err)}`);
     convertBtn.textContent = 'Model unavailable';
     convertBtn.disabled = true;
   }
@@ -344,17 +373,34 @@ async function init() {
 
 async function generate(text) {
   const encoded = tokenizer.encodeIds(STYLE_PREFIX + text);
+  validateIds(encoded, 'Tokenizer');
   const srcIds = [BOS, ...encoded.slice(0, MAX_LEN - 2), EOS];
+  validateIds(srcIds, 'src');
   const generated = [BOS];
 
   for (let step = 0; step < MAX_LEN - 1; step++) {
-    const feeds = {
-      src: toInt64Tensor(srcIds),
-      tgt_in: toInt64Tensor(generated),
-    };
-    const result = await session.run(feeds);
+    validateIds(generated, 'tgt');
+    setStatus(`端末内で推論中… ${step + 1}/${MAX_LEN - 1}`);
+
+    let result;
+    try {
+      result = await session.run({
+        src: toInt64Tensor(srcIds),
+        tgt_in: toInt64Tensor(generated),
+      });
+    } catch (err) {
+      const minSrc = Math.min(...srcIds);
+      const maxSrc = Math.max(...srcIds);
+      const minTgt = Math.min(...generated);
+      const maxTgt = Math.max(...generated);
+      throw new Error(`ONNX step ${step + 1}: ${errorText(err)} / srcLen=${srcIds.length} srcId=${minSrc}-${maxSrc} tgtLen=${generated.length} tgtId=${minTgt}-${maxTgt}`);
+    }
+
     const logits = result.logits ?? result[session.outputNames[0]];
     const nextId = argmaxLastToken(logits, generated);
+    if (!Number.isInteger(nextId) || nextId < 0 || nextId >= VOCAB_SIZE) {
+      throw new Error(`invalid output token id: ${nextId}`);
+    }
 
     if (nextId === EOS) break;
     if (nextId !== PAD && nextId !== BOS) generated.push(nextId);
@@ -369,7 +415,6 @@ convertBtn.addEventListener('click', async () => {
 
   convertBtn.disabled = true;
   convertBtn.textContent = 'Converting…';
-  setStatus('端末内で推論中…');
   outputEl.value = '';
 
   try {
@@ -378,7 +423,7 @@ convertBtn.addEventListener('click', async () => {
   } catch (err) {
     console.error(err);
     outputEl.value = '';
-    setStatus(`推論失敗: ${err?.message || err}`);
+    setStatus(`推論失敗: ${errorText(err)}`);
   } finally {
     convertBtn.disabled = false;
     convertBtn.textContent = 'Convert';
