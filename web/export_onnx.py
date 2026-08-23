@@ -82,9 +82,7 @@ class KuchoTransformer(nn.Module):
 
 model = KuchoTransformer()
 
-# pos.pe is a deterministic sinusoidal buffer, not a learned parameter.
-# Old checkpoints stored 1024 positions while newer configs may use 128.
-# Remove it before loading so PyTorch does not reject the size mismatch.
+# pos.pe is deterministic sinusoidal data, so ignore the checkpoint copy if its length differs.
 state_to_load = dict(state)
 checkpoint_pe = state_to_load.pop('pos.pe', None)
 if checkpoint_pe is not None:
@@ -103,6 +101,9 @@ src = torch.tensor([[2, 10, 11, 3]], dtype=torch.long)
 tgt = torch.tensor([[2, 10]], dtype=torch.long)
 
 with torch.no_grad():
+    # PyTorch 2.9+ defaults to the Dynamo exporter, which currently fails on
+    # nn.Transformer with dynamic sequence lengths. Use the mature TorchScript
+    # exporter instead; ONNX Runtime Web supports the resulting graph.
     torch.onnx.export(
         model,
         (src, tgt),
@@ -116,6 +117,7 @@ with torch.no_grad():
         },
         opset_version=17,
         do_constant_folding=True,
+        dynamo=False,
     )
 
 print('saved:', out_path)
