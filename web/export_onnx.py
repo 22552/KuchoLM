@@ -29,12 +29,10 @@ if 'embed.weight' in state:
     FORMAT = 'current'
     EMB_KEY = 'embed.weight'
     TF_PREFIX = 'tf'
-    HEAD_KEY = 'lm_head.weight'
 elif 'emb.weight' in state:
     FORMAT = 'legacy'
     EMB_KEY = 'emb.weight'
     TF_PREFIX = 'tr'
-    HEAD_KEY = 'head.weight'
 else:
     raise RuntimeError('Unknown KuchoLM checkpoint format: embedding weight not found')
 
@@ -51,6 +49,16 @@ PAD = 0
 print('format:', FORMAT)
 print(f'config: vocab={VOCAB} d_model={D_MODEL} heads={NHEAD} enc={ENC_LAYERS} dec={DEC_LAYERS} ff={FF} max_len={MAX_LEN}')
 
+
+def causal_bool_mask(length, device):
+    # A boolean causal mask is considerably simpler for ONNX Runtime Web than
+    # PyTorch's float mask containing -inf. Browser inference uses batch=1 and
+    # variable-length tensors with no padding, so key-padding masks are not
+    # needed at all and are deliberately omitted from the exported graph.
+    positions = torch.arange(length, device=device)
+    return positions.unsqueeze(0) > positions.unsqueeze(1)
+
+
 class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len):
         super().__init__()
@@ -64,31 +72,32 @@ class SinusoidalPositionalEncoding(nn.Module):
     def forward(self, x):
         return x + self.pe[:, :x.size(1)]
 
+
 class LegacyKuchoTransformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.emb = nn.Embedding(VOCAB, D_MODEL, padding_idx=PAD)
         self.pos = SinusoidalPositionalEncoding(D_MODEL, MAX_LEN)
         self.tr = nn.Transformer(
-            d_model=D_MODEL, nhead=NHEAD,
-            num_encoder_layers=ENC_LAYERS, num_decoder_layers=DEC_LAYERS,
-            dim_feedforward=FF, dropout=0.0,
-            batch_first=True, norm_first=True,
+            d_model=D_MODEL,
+            nhead=NHEAD,
+            num_encoder_layers=ENC_LAYERS,
+            num_decoder_layers=DEC_LAYERS,
+            dim_feedforward=FF,
+            dropout=0.0,
+            batch_first=True,
+            norm_first=True,
         )
         self.head = nn.Linear(D_MODEL, VOCAB, bias=False)
         self.head.weight = self.emb.weight
 
     def forward(self, src, tgt_in):
-        src_pad = src.eq(PAD)
-        tgt_pad = tgt_in.eq(PAD)
-        mask = nn.Transformer.generate_square_subsequent_mask(tgt_in.size(1), device=tgt_in.device)
+        mask = causal_bool_mask(tgt_in.size(1), tgt_in.device)
         src_h = self.pos(self.emb(src) * math.sqrt(D_MODEL))
         tgt_h = self.pos(self.emb(tgt_in) * math.sqrt(D_MODEL))
-        h = self.tr(src_h, tgt_h, tgt_mask=mask,
-                    src_key_padding_mask=src_pad,
-                    tgt_key_padding_mask=tgt_pad,
-                    memory_key_padding_mask=src_pad)
+        h = self.tr(src_h, tgt_h, tgt_mask=mask)
         return self.head(h)
+
 
 class CurrentKuchoTransformer(nn.Module):
     def __init__(self):
@@ -96,10 +105,14 @@ class CurrentKuchoTransformer(nn.Module):
         self.embed = nn.Embedding(VOCAB, D_MODEL, padding_idx=PAD)
         self.pos = nn.Embedding(MAX_LEN, D_MODEL)
         self.tf = nn.Transformer(
-            d_model=D_MODEL, nhead=NHEAD,
-            num_encoder_layers=ENC_LAYERS, num_decoder_layers=DEC_LAYERS,
-            dim_feedforward=FF, dropout=0.0,
-            batch_first=True, norm_first=True,
+            d_model=D_MODEL,
+            nhead=NHEAD,
+            num_encoder_layers=ENC_LAYERS,
+            num_decoder_layers=DEC_LAYERS,
+            dim_feedforward=FF,
+            dropout=0.0,
+            batch_first=True,
+            norm_first=True,
         )
         self.lm_head = nn.Linear(D_MODEL, VOCAB, bias=False)
         self.lm_head.weight = self.embed.weight
@@ -109,15 +122,10 @@ class CurrentKuchoTransformer(nn.Module):
         return self.embed(x) * math.sqrt(D_MODEL) + self.pos(p)
 
     def forward(self, src, tgt_in):
-        src_pad = src.eq(PAD)
-        tgt_pad = tgt_in.eq(PAD)
-        mask = nn.Transformer.generate_square_subsequent_mask(tgt_in.size(1), device=tgt_in.device)
-        h = self.tf(self.add_pos(src), self.add_pos(tgt_in),
-                    tgt_mask=mask,
-                    src_key_padding_mask=src_pad,
-                    tgt_key_padding_mask=tgt_pad,
-                    memory_key_padding_mask=src_pad)
+        mask = causal_bool_mask(tgt_in.size(1), tgt_in.device)
+        h = self.tf(self.add_pos(src), self.add_pos(tgt_in), tgt_mask=mask)
         return self.lm_head(h)
+
 
 model = CurrentKuchoTransformer() if FORMAT == 'current' else LegacyKuchoTransformer()
 state_to_load = dict(state)
@@ -139,12 +147,17 @@ print(f'parameters: {params / 1e6:.2f}M')
 fastpath_was_enabled = torch.backends.mha.get_fastpath_enabled()
 torch.backends.mha.set_fastpath_enabled(False)
 print('mha fastpath: disabled for ONNX export')
+print('browser export: boolean causal mask, no key-padding masks')
 
 src = torch.tensor([[2, 10, 11, 3]], dtype=torch.long)
 tgt = torch.tensor([[2, 10]], dtype=torch.long)
 
 try:
     with torch.no_grad():
+        # Verify the exact wrapper before exporting it.
+        smoke = model(src, tgt)
+        print('pytorch smoke:', tuple(smoke.shape), 'finite=', bool(torch.isfinite(smoke).all()))
+
         torch.onnx.export(
             model,
             (src, tgt),
