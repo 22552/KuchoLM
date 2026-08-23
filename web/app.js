@@ -78,12 +78,10 @@ async function downloadWithProgress(url, label, overallStart = 0, overallSpan = 
   return result;
 }
 
-// Minimal protobuf reader for SentencePiece ModelProto. KuchoLM uses BPE, so we
-// only need ModelProto.pieces and each SentencePiece { piece, score, type }.
-function readVarint(bytes, state) {
+function readVarint(bytes, state, end = bytes.length) {
   let value = 0;
   let shift = 0;
-  while (state.i < bytes.length) {
+  while (state.i < end) {
     const b = bytes[state.i++];
     value += (b & 0x7f) * 2 ** shift;
     if ((b & 0x80) === 0) return value;
@@ -93,44 +91,56 @@ function readVarint(bytes, state) {
   throw new Error('Unexpected end of tokenizer protobuf');
 }
 
-function skipField(bytes, state, wire) {
+function skipField(bytes, state, wire, end = bytes.length) {
   if (wire === 0) {
-    readVarint(bytes, state);
+    readVarint(bytes, state, end);
   } else if (wire === 1) {
     state.i += 8;
   } else if (wire === 2) {
-    state.i += readVarint(bytes, state);
+    state.i += readVarint(bytes, state, end);
+  } else if (wire === 3) {
+    while (state.i < end) {
+      const key = readVarint(bytes, state, end);
+      const nestedWire = key & 7;
+      if (nestedWire === 4) return;
+      skipField(bytes, state, nestedWire, end);
+    }
+  } else if (wire === 4) {
+    return;
   } else if (wire === 5) {
     state.i += 4;
   } else {
     throw new Error(`Unsupported protobuf wire type ${wire}`);
   }
-  if (state.i > bytes.length) throw new Error('Tokenizer protobuf is truncated');
+  if (state.i > end) throw new Error('Tokenizer protobuf is truncated');
 }
 
 function parseSentencePieceMessage(bytes, start, end) {
   const state = { i: start };
   let piece = '';
   let score = 0;
-  let type = 1; // NORMAL
+  let type = 1;
   const decoder = new TextDecoder('utf-8');
 
   while (state.i < end) {
-    const key = readVarint(bytes, state);
-    const field = key >>> 3;
+    const key = readVarint(bytes, state, end);
+    const field = Math.floor(key / 8);
     const wire = key & 7;
 
     if (field === 1 && wire === 2) {
-      const len = readVarint(bytes, state);
-      piece = decoder.decode(bytes.subarray(state.i, state.i + len));
-      state.i += len;
+      const len = readVarint(bytes, state, end);
+      const fieldEnd = state.i + len;
+      if (fieldEnd > end) throw new Error('Tokenizer piece string is truncated');
+      piece = decoder.decode(bytes.subarray(state.i, fieldEnd));
+      state.i = fieldEnd;
     } else if (field === 2 && wire === 5) {
+      if (state.i + 4 > end) throw new Error('Tokenizer piece score is truncated');
       score = new DataView(bytes.buffer, bytes.byteOffset + state.i, 4).getFloat32(0, true);
       state.i += 4;
     } else if (field === 3 && wire === 0) {
-      type = readVarint(bytes, state);
+      type = readVarint(bytes, state, end);
     } else {
-      skipField(bytes, state, wire);
+      skipField(bytes, state, wire, end);
     }
   }
 
@@ -141,9 +151,14 @@ function parseSentencePieceModel(bytes) {
   const state = { i: 0 };
   const pieces = [];
 
+  // SentencePiece serializes ModelProto.pieces (field 1) first, followed by
+  // TrainerSpec / NormalizerSpec metadata. We only need the vocabulary for
+  // browser inference, so stop as soon as the contiguous piece list ends.
+  // This deliberately avoids trying to fully decode unrelated protobuf specs.
   while (state.i < bytes.length) {
+    const keyStart = state.i;
     const key = readVarint(bytes, state);
-    const field = key >>> 3;
+    const field = Math.floor(key / 8);
     const wire = key & 7;
 
     if (field === 1 && wire === 2) {
@@ -153,9 +168,17 @@ function parseSentencePieceModel(bytes) {
       if (end > bytes.length) throw new Error('Tokenizer piece is truncated');
       pieces.push(parseSentencePieceMessage(bytes, start, end));
       state.i = end;
-    } else {
-      skipField(bytes, state, wire);
+      continue;
     }
+
+    if (pieces.length > 0) {
+      // Vocabulary is complete; the remaining fields are metadata that is not
+      // required by the lightweight browser tokenizer.
+      state.i = keyStart;
+      break;
+    }
+
+    skipField(bytes, state, wire);
   }
 
   if (pieces.length < 4) throw new Error('SentencePiece vocabulary could not be parsed');
@@ -174,13 +197,10 @@ class BrowserSentencePieceBPE {
       if (p.type === 4 && p.piece) this.userDefined.push(p.piece);
     }
 
-    // Match longer user-defined symbols first.
     this.userDefined.sort((a, b) => b.length - a.length);
   }
 
   normalize(text) {
-    // SentencePiece's default nmt_nfkc behavior is close to Unicode NFKC for
-    // KuchoLM's Japanese corpus. Match its default whitespace handling too.
     const clean = text.normalize('NFKC').replace(/\s+/gu, ' ').trim();
     return SPIECE_UNDERLINE + clean.replace(/ /g, SPIECE_UNDERLINE);
   }
@@ -219,7 +239,6 @@ class BrowserSentencePieceBPE {
     const normalized = this.normalize(text);
     const symbols = this.initialSymbols(normalized);
 
-    // SentencePiece BPE repeatedly applies the highest-scoring available merge.
     while (symbols.length > 1) {
       let bestIndex = -1;
       let bestScore = -Infinity;
@@ -232,8 +251,6 @@ class BrowserSentencePieceBPE {
         if (id === undefined) continue;
 
         const p = this.pieces[id];
-        // NORMAL and USER_DEFINED are usable pieces; user-defined pieces are
-        // already atomized above, so only NORMAL should normally reach here.
         if (p.type !== 1 && p.type !== 4) continue;
         if (p.score > bestScore) {
           bestScore = p.score;
@@ -256,7 +273,6 @@ class BrowserSentencePieceBPE {
       const id = Number(rawId);
       const p = this.pieces[id];
       if (!p) continue;
-      // CONTROL pieces (BOS/EOS/PAD) are not emitted as text.
       if (p.type === 3) continue;
       if (p.type === 2) {
         text += '⁇';
