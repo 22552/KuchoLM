@@ -7,39 +7,51 @@ from huggingface_hub import hf_hub_download
 
 parser = argparse.ArgumentParser(description='Download a KuchoLM .pt checkpoint from Hugging Face and export it to ONNX.')
 parser.add_argument('--repo', default='h6e/KuchoLM-NIDA-10M', help='Hugging Face model repo ID')
-parser.add_argument('--pt', default='KuchoLM-NIDA.pt', help='Checkpoint filename inside the Hugging Face repo')
+parser.add_argument('--pt', default='KuchoLM-NIDA-10M.pt', help='Checkpoint filename inside the Hugging Face repo')
 parser.add_argument('--out', default='/content/model.onnx', help='Output ONNX path')
 args = parser.parse_args()
 
 print('repo:', args.repo)
 print('checkpoint:', args.pt)
-
 checkpoint_path = Path(hf_hub_download(repo_id=args.repo, filename=args.pt, repo_type='model'))
 out_path = Path(args.out)
 out_path.parent.mkdir(parents=True, exist_ok=True)
-
 print('downloaded:', checkpoint_path)
 
 ckpt = torch.load(checkpoint_path, map_location='cpu')
+state = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
 cfg = ckpt.get('config', {}) if isinstance(ckpt, dict) else {}
 
-VOCAB = int(cfg.get('vocab', 8000))
-D_MODEL = int(cfg.get('d_model', 256))
+VOCAB = int(cfg.get('vocab', state['emb.weight'].shape[0] if 'emb.weight' in state else 8000))
+D_MODEL = int(cfg.get('d_model', state['emb.weight'].shape[1] if 'emb.weight' in state else 256))
 NHEAD = int(cfg.get('nhead', 8))
-ENC_LAYERS = int(cfg.get('enc_layers', 4))
-DEC_LAYERS = int(cfg.get('dec_layers', 4))
-FF = int(cfg.get('ff', 1024))
+ENC_LAYERS = int(cfg.get('enc_layers', len({k.split('.')[3] for k in state if k.startswith('tr.encoder.layers.')})))
+DEC_LAYERS = int(cfg.get('dec_layers', len({k.split('.')[3] for k in state if k.startswith('tr.decoder.layers.')})))
+FF = int(cfg.get('ff', state['tr.encoder.layers.0.linear1.weight'].shape[0] if 'tr.encoder.layers.0.linear1.weight' in state else 1024))
 MAX_LEN = int(cfg.get('max_len', 128))
 PAD = 0
 
 print(f'config: vocab={VOCAB} d_model={D_MODEL} heads={NHEAD} enc={ENC_LAYERS} dec={DEC_LAYERS} ff={FF} max_len={MAX_LEN}')
 
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len):
+        super().__init__()
+        position = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model, dtype=torch.float32)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
 class KuchoTransformer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.embed = nn.Embedding(VOCAB, D_MODEL, padding_idx=PAD)
-        self.pos = nn.Embedding(MAX_LEN, D_MODEL)
-        self.tf = nn.Transformer(
+        self.emb = nn.Embedding(VOCAB, D_MODEL, padding_idx=PAD)
+        self.pos = SinusoidalPositionalEncoding(D_MODEL, MAX_LEN)
+        self.tr = nn.Transformer(
             d_model=D_MODEL,
             nhead=NHEAD,
             num_encoder_layers=ENC_LAYERS,
@@ -49,32 +61,36 @@ class KuchoTransformer(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.lm_head = nn.Linear(D_MODEL, VOCAB, bias=False)
-        self.lm_head.weight = self.embed.weight
-
-    def add_pos(self, x):
-        p = torch.arange(x.size(1), device=x.device).unsqueeze(0)
-        return self.embed(x) * math.sqrt(D_MODEL) + self.pos(p)
+        self.head = nn.Linear(D_MODEL, VOCAB, bias=False)
+        self.head.weight = self.emb.weight
 
     def forward(self, src, tgt_in):
         src_pad = src.eq(PAD)
         tgt_pad = tgt_in.eq(PAD)
         mask = nn.Transformer.generate_square_subsequent_mask(tgt_in.size(1), device=tgt_in.device)
-        h = self.tf(
-            self.add_pos(src),
-            self.add_pos(tgt_in),
+        src_h = self.pos(self.emb(src) * math.sqrt(D_MODEL))
+        tgt_h = self.pos(self.emb(tgt_in) * math.sqrt(D_MODEL))
+        h = self.tr(
+            src_h,
+            tgt_h,
             tgt_mask=mask,
             src_key_padding_mask=src_pad,
             tgt_key_padding_mask=tgt_pad,
             memory_key_padding_mask=src_pad,
         )
-        return self.lm_head(h)
+        return self.head(h)
 
 model = KuchoTransformer()
-state = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
-model.load_state_dict(state)
-model.eval()
+missing, unexpected = model.load_state_dict(state, strict=False)
 
+# Older checkpoints sometimes stored a longer sinusoidal PE buffer. It is not a learned
+# parameter, so only pos.pe is allowed to differ. Any other mismatch is a real error.
+real_missing = [k for k in missing if k != 'pos.pe']
+real_unexpected = [k for k in unexpected if k != 'pos.pe']
+if real_missing or real_unexpected:
+    raise RuntimeError(f'state_dict mismatch: missing={real_missing}, unexpected={real_unexpected}')
+
+model.eval()
 params = sum(p.numel() for p in model.parameters())
 print(f'parameters: {params / 1e6:.2f}M')
 
