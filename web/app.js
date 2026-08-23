@@ -213,20 +213,16 @@ class BrowserSentencePieceBPE {
   }
 }
 
-function argmaxAtPosition(logits, position, generated, repetitionPenalty = 1.15) {
+function argmaxAtPosition(logits, position) {
   const vocab = logits.dims.at(-1);
   const seqLen = logits.dims.at(-2);
   if (seqLen !== MAX_LEN || position < 0 || position >= seqLen) {
     throw new Error(`unexpected logits shape/position: ${logits.dims.join('x')} pos=${position}`);
   }
   const offset = position * vocab;
-  const seen = new Set(generated);
   let bestId = 0, bestScore = -Infinity;
   for (let id = 0; id < vocab; id++) {
-    let score = logits.data[offset + id];
-    if (seen.has(id) && id !== BOS && id !== EOS) {
-      score = score >= 0 ? score / repetitionPenalty : score * repetitionPenalty;
-    }
+    const score = logits.data[offset + id];
     if (score > bestScore) { bestScore = score; bestId = id; }
   }
   return bestId;
@@ -301,7 +297,7 @@ async function generate(text) {
       throw new Error(`ONNX step ${step + 1}: ${errorText(err)} / fixed=[1,128] tgtUsed=${generated.length}`);
     }
     const logits = result.logits ?? result[session.outputNames[0]];
-    const nextId = argmaxAtPosition(logits, generated.length - 1, generated);
+    const nextId = argmaxAtPosition(logits, generated.length - 1);
     if (!Number.isInteger(nextId) || nextId < 0 || nextId >= VOCAB_SIZE) {
       throw new Error(`invalid output token id: ${nextId}`);
     }
