@@ -2,6 +2,7 @@ import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/o
 
 const MODEL_URL = 'https://huggingface.co/h6e/KuchoLM-NIDA-10M/resolve/main/model.onnx';
 const TOKENIZER_URL = 'https://huggingface.co/h6e/KuchoLM-NIDA-10M/resolve/main/kucholm_spm.model';
+const SENTENCEPIECE_MODULE_URL = 'https://esm.sh/@sctg/sentencepiece-js@1.3.3?bundle';
 
 const PAD = 0;
 const BOS = 2;
@@ -16,7 +17,7 @@ const outputEl = document.querySelector('#output');
 
 let session = null;
 let tokenizer = null;
-let getSentencePieceTokenizer = null;
+let SentencePieceProcessor = null;
 
 function setStatus(message) {
   statusEl.textContent = message;
@@ -76,6 +77,15 @@ async function downloadWithProgress(url, label, overallStart = 0, overallSpan = 
   return result;
 }
 
+function bytesToBase64(bytes) {
+  const CHUNK = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
 function argmaxLastToken(logits, generated, repetitionPenalty = 1.15) {
   const dims = logits.dims;
   const vocab = dims[dims.length - 1];
@@ -101,11 +111,11 @@ function argmaxLastToken(logits, generated, repetitionPenalty = 1.15) {
 async function loadTokenizerLibrary() {
   setStatus('Tokenizerライブラリを読み込み中…');
   try {
-    const mod = await import('https://esm.sh/ai-token-estimator?bundle');
-    if (typeof mod.getSentencePieceTokenizer !== 'function') {
-      throw new Error('getSentencePieceTokenizer が見つかりません');
+    const mod = await import(SENTENCEPIECE_MODULE_URL);
+    if (typeof mod.SentencePieceProcessor !== 'function') {
+      throw new Error('SentencePieceProcessor が見つかりません');
     }
-    getSentencePieceTokenizer = mod.getSentencePieceTokenizer;
+    SentencePieceProcessor = mod.SentencePieceProcessor;
   } catch (err) {
     throw new Error(`Tokenizerライブラリ読み込み失敗: ${err?.message || err}`);
   }
@@ -133,7 +143,8 @@ async function init() {
 
     const tokenizerBytes = await downloadWithProgress(TOKENIZER_URL, 'Tokenizer', 90, 10);
     setStatus('Tokenizerを初期化中… 100%');
-    tokenizer = getSentencePieceTokenizer({ modelData: tokenizerBytes });
+    tokenizer = new SentencePieceProcessor();
+    await tokenizer.loadFromB64StringModel(bytesToBase64(tokenizerBytes));
 
     setStatus('準備完了。ダウンロード 100%。推論はこの端末内だけで実行されます。');
     convertBtn.textContent = 'Convert';
@@ -147,7 +158,7 @@ async function init() {
 }
 
 async function generate(text) {
-  const encodedRaw = tokenizer.encode(STYLE_PREFIX + text);
+  const encodedRaw = tokenizer.encodeIds(STYLE_PREFIX + text);
   const encoded = Array.from(encodedRaw, Number);
   const srcIds = [BOS, ...encoded.slice(0, MAX_LEN - 2), EOS];
   const generated = [BOS];
@@ -165,7 +176,7 @@ async function generate(text) {
     if (nextId !== PAD && nextId !== BOS) generated.push(nextId);
   }
 
-  return tokenizer.decode(Uint32Array.from(generated.slice(1)));
+  return tokenizer.decodeIds(generated.slice(1));
 }
 
 convertBtn.addEventListener('click', async () => {
