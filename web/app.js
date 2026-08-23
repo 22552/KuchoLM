@@ -22,6 +22,52 @@ function toInt64Tensor(ids) {
   return new ort.Tensor('int64', BigInt64Array.from(ids, (x) => BigInt(x)), [1, ids.length]);
 }
 
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+async function downloadWithProgress(url, label, overallStart = 0, overallSpan = 100) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${label} download failed (${response.status})`);
+  if (!response.body) return new Uint8Array(await response.arrayBuffer());
+
+  const total = Number(response.headers.get('content-length')) || 0;
+  const reader = response.body.getReader();
+  const chunks = [];
+  let received = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.byteLength;
+
+    if (total > 0) {
+      const localPercent = Math.min(100, Math.round((received / total) * 100));
+      const overallPercent = Math.min(100, Math.round(overallStart + (localPercent / 100) * overallSpan));
+      statusEl.textContent = `${label}をダウンロード中… ${localPercent}% (${formatBytes(received)} / ${formatBytes(total)}) — 全体 ${overallPercent}%`;
+    } else {
+      statusEl.textContent = `${label}をダウンロード中… ${formatBytes(received)}`;
+    }
+  }
+
+  const result = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
 function argmaxLastToken(logits, generated, repetitionPenalty = 1.15) {
   const dims = logits.dims;
   const vocab = dims[dims.length - 1];
@@ -44,33 +90,27 @@ function argmaxLastToken(logits, generated, repetitionPenalty = 1.15) {
   return bestId;
 }
 
-async function loadTokenizer() {
-  const response = await fetch(TOKENIZER_URL);
-  if (!response.ok) {
-    throw new Error(`SentencePiece model download failed (${response.status})`);
-  }
-
-  const modelData = new Uint8Array(await response.arrayBuffer());
-  tokenizer = getSentencePieceTokenizer({ modelData });
-}
-
 async function init() {
   try {
-    statusEl.textContent = 'モデルを読み込んでいます…';
+    convertBtn.disabled = true;
+    convertBtn.textContent = 'Loading…';
 
     ort.env.wasm.numThreads = globalThis.crossOriginIsolated
       ? Math.min(navigator.hardwareConcurrency || 1, 4)
       : 1;
 
-    [session] = await Promise.all([
-      ort.InferenceSession.create(MODEL_URL, {
-        executionProviders: ['wasm'],
-        graphOptimizationLevel: 'all',
-      }),
-      loadTokenizer(),
-    ]);
+    const modelBytes = await downloadWithProgress(MODEL_URL, 'モデル', 0, 90);
+    statusEl.textContent = 'モデルを初期化中… 90%';
+    session = await ort.InferenceSession.create(modelBytes, {
+      executionProviders: ['wasm'],
+      graphOptimizationLevel: 'all',
+    });
 
-    statusEl.textContent = '準備完了。推論はこの端末内だけで実行されます。';
+    const tokenizerBytes = await downloadWithProgress(TOKENIZER_URL, 'Tokenizer', 90, 10);
+    statusEl.textContent = 'Tokenizerを初期化中… 100%';
+    tokenizer = getSentencePieceTokenizer({ modelData: tokenizerBytes });
+
+    statusEl.textContent = '準備完了。ダウンロード 100%。推論はこの端末内だけで実行されます。';
     convertBtn.textContent = 'Convert';
     convertBtn.disabled = false;
   } catch (err) {
