@@ -1,5 +1,5 @@
 import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.mjs';
-import { SentencePieceProcessor } from 'https://esm.sh/@sctg/sentencepiece-js';
+import { getSentencePieceTokenizer } from 'https://esm.sh/ai-token-estimator';
 
 const MODEL_URL = 'https://huggingface.co/h6e/KuchoLM-NIDA-10M/resolve/main/model.onnx';
 const TOKENIZER_URL = 'https://huggingface.co/h6e/KuchoLM-NIDA-10M/resolve/main/kucholm_spm.model';
@@ -50,18 +50,14 @@ async function loadTokenizer() {
     throw new Error(`SentencePiece model download failed (${response.status})`);
   }
 
-  // sentencepiece-js load() accepts a URL in browsers. We fetch once first so
-  // missing/CORS errors are reported clearly before constructing the processor.
-  tokenizer = new SentencePieceProcessor();
-  await tokenizer.load(TOKENIZER_URL);
+  const modelData = new Uint8Array(await response.arrayBuffer());
+  tokenizer = getSentencePieceTokenizer({ modelData });
 }
 
 async function init() {
   try {
     statusEl.textContent = 'モデルを読み込んでいます…';
 
-    // SharedArrayBuffer is not available on every static host, so keep WASM
-    // single-threaded unless the page is cross-origin isolated.
     ort.env.wasm.numThreads = globalThis.crossOriginIsolated
       ? Math.min(navigator.hardwareConcurrency || 1, 4)
       : 1;
@@ -86,7 +82,8 @@ async function init() {
 }
 
 async function generate(text) {
-  const encoded = tokenizer.encodeIds(STYLE_PREFIX + text);
+  const encodedRaw = tokenizer.encode(STYLE_PREFIX + text);
+  const encoded = Array.from(encodedRaw, Number);
   const srcIds = [BOS, ...encoded.slice(0, MAX_LEN - 2), EOS];
   const generated = [BOS];
 
@@ -103,7 +100,7 @@ async function generate(text) {
     if (nextId !== PAD && nextId !== BOS) generated.push(nextId);
   }
 
-  return tokenizer.decodeIds(generated.slice(1));
+  return tokenizer.decode(Uint32Array.from(generated.slice(1)));
 }
 
 convertBtn.addEventListener('click', async () => {
