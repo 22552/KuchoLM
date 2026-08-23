@@ -97,28 +97,34 @@ model.eval()
 params = sum(p.numel() for p in model.parameters())
 print(f'parameters: {params / 1e6:.2f}M')
 
+# Disable PyTorch's fused Transformer fastpath while tracing. The fused
+# _transformer_encoder_layer_fwd op is not exported by the legacy ONNX path.
+fastpath_was_enabled = torch.backends.mha.get_fastpath_enabled()
+torch.backends.mha.set_fastpath_enabled(False)
+print('mha fastpath: disabled for ONNX export')
+
 src = torch.tensor([[2, 10, 11, 3]], dtype=torch.long)
 tgt = torch.tensor([[2, 10]], dtype=torch.long)
 
-with torch.no_grad():
-    # PyTorch 2.9+ defaults to the Dynamo exporter, which currently fails on
-    # nn.Transformer with dynamic sequence lengths. Use the mature TorchScript
-    # exporter instead; ONNX Runtime Web supports the resulting graph.
-    torch.onnx.export(
-        model,
-        (src, tgt),
-        out_path,
-        input_names=['src', 'tgt_in'],
-        output_names=['logits'],
-        dynamic_axes={
-            'src': {0: 'batch', 1: 'src_len'},
-            'tgt_in': {0: 'batch', 1: 'tgt_len'},
-            'logits': {0: 'batch', 1: 'tgt_len'},
-        },
-        opset_version=17,
-        do_constant_folding=True,
-        dynamo=False,
-    )
+try:
+    with torch.no_grad():
+        torch.onnx.export(
+            model,
+            (src, tgt),
+            out_path,
+            input_names=['src', 'tgt_in'],
+            output_names=['logits'],
+            dynamic_axes={
+                'src': {0: 'batch', 1: 'src_len'},
+                'tgt_in': {0: 'batch', 1: 'tgt_len'},
+                'logits': {0: 'batch', 1: 'tgt_len'},
+            },
+            opset_version=18,
+            do_constant_folding=True,
+            dynamo=False,
+        )
+finally:
+    torch.backends.mha.set_fastpath_enabled(fastpath_was_enabled)
 
 print('saved:', out_path)
 print('source:', f'https://huggingface.co/{args.repo}/blob/main/{args.pt}')
