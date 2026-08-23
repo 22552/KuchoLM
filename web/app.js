@@ -2,7 +2,9 @@ import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/o
 
 const MODEL_URL = 'https://huggingface.co/h6e/KuchoLM-NIDA-10M/resolve/main/model.onnx';
 const TOKENIZER_URL = 'https://huggingface.co/h6e/KuchoLM-NIDA-10M/resolve/main/kucholm_spm.model';
-const SENTENCEPIECE_MODULE_URL = 'https://esm.sh/@sctg/sentencepiece-js@1.3.3?bundle';
+// Use the package's already-browser-built Rollup ESM directly. Do NOT pass it
+// through esm.sh: that conversion introduced Node/unenv require() shims on iOS.
+const SENTENCEPIECE_MODULE_URL = 'https://cdn.jsdelivr.net/npm/@sctg/sentencepiece-js@1.3.3/dist/index.js';
 
 const PAD = 0;
 const BOS = 2;
